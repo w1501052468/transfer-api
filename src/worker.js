@@ -556,6 +556,8 @@ function streamOpenAIChat(upstream, meta) {
 
 function streamOpenAIResponses(upstream, meta) {
   const outputId = `msg_${randomId()}`;
+  let fullText = "";
+
   return streamUnlimitedEvents(upstream, {
     start(controller) {
       writeSseEvent(controller, "response.created", {
@@ -583,6 +585,7 @@ function streamOpenAIResponses(upstream, meta) {
       });
     },
     delta(controller, text) {
+      fullText += text;
       writeSseEvent(controller, "response.output_text.delta", {
         type: "response.output_text.delta",
         item_id: outputId,
@@ -591,29 +594,53 @@ function streamOpenAIResponses(upstream, meta) {
         delta: text,
       });
     },
-    finish(controller) {
+    finish(controller, reason) {
+      const content = [{ type: "output_text", text: fullText, annotations: [] }];
+      const outputItem = {
+        id: outputId,
+        type: "message",
+        status: "completed",
+        role: "assistant",
+        content,
+      };
+
       writeSseEvent(controller, "response.output_text.done", {
         type: "response.output_text.done",
         item_id: outputId,
         output_index: 0,
         content_index: 0,
-        text: "",
+        text: fullText,
       });
       writeSseEvent(controller, "response.content_part.done", {
         type: "response.content_part.done",
         item_id: outputId,
         output_index: 0,
         content_index: 0,
-        part: { type: "output_text", text: "", annotations: [] },
+        part: content[0],
       });
       writeSseEvent(controller, "response.output_item.done", {
         type: "response.output_item.done",
         output_index: 0,
-        item: { id: outputId, type: "message", status: "completed", role: "assistant", content: [] },
+        item: outputItem,
       });
       writeSseEvent(controller, "response.completed", {
         type: "response.completed",
-        response: { id: meta.id, object: "response", created_at: meta.created, status: "completed", model: meta.model },
+        response: {
+          id: meta.id,
+          object: "response",
+          created_at: meta.created,
+          status: "completed",
+          error: null,
+          incomplete_details: null,
+          model: meta.model,
+          output: [outputItem],
+          output_text: fullText,
+          parallel_tool_calls: true,
+          tool_choice: "auto",
+          tools: [],
+          usage: null,
+          stop_reason: openAIStopReason(reason),
+        },
       });
       writeRawSse(controller, "data: [DONE]\n\n");
     },
@@ -661,76 +688,80 @@ function streamAnthropicMessages(upstream, meta) {
   });
 }
 
-async function streamUnlimitedEvents(upstream, handlers, controller, textNormalizer) {
-  const reader = upstream.body.getReader();
+function streamUnlimitedEvents(upstream, handlers) {
+  const encoder = new TextEncoder();
   const decoder = new TextDecoder();
-  let buffer = "";
-  let finished = false;
 
-  const flushEvent = (parsed) => {
-    if (typeof parsed.delta === "string" && parsed.delta.length) {
-      const text = textNormalizer.push(parsed.delta);
-      if (text) handlers.delta && handlers.delta(controller, text, parsed);
-    }
-    if (parsed.finish || parsed.done) {
-      const tail = textNormalizer.flush();
-      if (tail) handlers.delta && handlers.delta(controller, tail, parsed);
-      finished = true;
-      handlers.finish && handlers.finish(controller, parsed.reason || "stop", parsed);
-    }
-  };
+  return new ReadableStream({
+    async start(controller) {
+      let finished = false;
+      const textNormalizer = createStreamingTextNormalizer();
+      handlers.start && handlers.start(controller);
 
-  const drainBuffer = (final) => {
-    // 按完整事件块（空行分隔）解析，聚合多行 data:
-    const parts = buffer.split(/\r?\n\r?\n/);
-    buffer = final ? "" : (parts.pop() || "");
-    const blocks = final ? parts.concat(buffer ? [buffer] : []) : parts;
-    for (const raw of blocks) {
-      const dataLines = raw
-        .split(/\r?\n/)
-        .filter((l) => l.startsWith("data:"))
-        .map((l) => l.slice(5).replace(/^ /, ""));
-      if (!dataLines.length) continue;
-      const joined = dataLines.join("\n").trim();
-      if (joined === "[DONE]") {
-        if (!finished) {
-          const tail = textNormalizer.flush();
-          if (tail) handlers.delta && handlers.delta(controller, tail, {});
-          finished = true;
-          handlers.finish && handlers.finish(controller, "stop", {});
+      const finish = (reason = "stop", parsed = {}) => {
+        if (finished) return;
+        const tail = textNormalizer.flush();
+        if (tail) handlers.delta && handlers.delta(controller, tail, parsed);
+        finished = true;
+        handlers.finish && handlers.finish(controller, reason, parsed);
+      };
+
+      const handleEvent = (parsed) => {
+        if (!parsed) return;
+
+        if (typeof parsed.delta === "string" && parsed.delta.length) {
+          const text = textNormalizer.push(parsed.delta);
+          if (text) handlers.delta && handlers.delta(controller, text, parsed);
         }
-        continue;
-      }
-      const parsed = parseSseJson(joined);
-      if (parsed) flushEvent(parsed);
-    }
-  };
 
-  try {
-    while (true) {
-      let chunk;
+        if (parsed.finish || parsed.done) {
+          finish(parsed.reason || "stop", parsed);
+        }
+      };
+
       try {
-        chunk = await readWithTimeout(reader, 60000);
-      } catch (e) {
-        // idle 超时：收尾而非丢弃
-        break;
+        const reader = upstream.body.getReader();
+        let buffer = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const blocks = buffer.split(/\r?\n\r?\n/);
+          buffer = blocks.pop() || "";
+
+          for (const block of blocks) {
+            const data = sseBlockData(block);
+            if (!data) continue;
+            if (data === "[DONE]") {
+              finish("stop", {});
+              continue;
+            }
+            handleEvent(parseSseJson(data));
+          }
+
+          if (finished) break;
+        }
+
+        buffer += decoder.decode();
+        if (!finished && buffer) {
+          const data = sseBlockData(buffer);
+          if (data === "[DONE]") {
+            finish("stop", {});
+          } else if (data) {
+            handleEvent(parseSseJson(data));
+          }
+        }
+
+        finish("stop", {});
+      } catch (error) {
+        controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ error: error.message || String(error) })}\n\n`));
+      } finally {
+        controller.close();
       }
-      if (chunk.done) break;
-      buffer += decoder.decode(chunk.value, { stream: true });
-      drainBuffer(false);
-      if (finished) break;
-    }
-  } finally {
-    buffer += decoder.decode(); // flush 解码器残留字节
-    if (!finished) drainBuffer(true);
-    if (!finished) {
-      const tail = textNormalizer.flush();
-      if (tail) handlers.delta && handlers.delta(controller, tail, {});
-      handlers.finish && handlers.finish(controller, "stop", {});
-      finished = true;
-    }
-    try { reader.releaseLock(); } catch (_) {}
-  }
+    },
+  });
 }
 
 async function readUnlimitedEvents(response) {
@@ -742,22 +773,35 @@ async function readUnlimitedEvents(response) {
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
+
     buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split(/\r?\n/);
-    buffer = lines.pop() || "";
-    for (const line of lines) {
-      if (!line.startsWith("data:")) continue;
-      const parsed = parseSseJson(line.slice(5).trim());
+
+    const blocks = buffer.split(/\r?\n\r?\n/);
+    buffer = blocks.pop() || "";
+    for (const block of blocks) {
+      const parsed = parseSseJson(sseBlockData(block));
       if (parsed) events.push(parsed);
     }
   }
 
-  if (buffer.startsWith("data:")) {
-    const parsed = parseSseJson(buffer.slice(5).trim());
+  buffer += decoder.decode();
+  if (buffer) {
+    const parsed = parseSseJson(sseBlockData(buffer));
     if (parsed) events.push(parsed);
   }
 
   return events;
+}
+
+function sseBlockData(block) {
+  if (!block) return "";
+
+  return block
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).replace(/^ /, ""))
+    .join("\n")
+    .trim();
 }
 
 function writeSse(controller, data) {
@@ -1042,7 +1086,9 @@ function normalizeUpstreamText(text) {
 
 function createStreamingTextNormalizer() {
   let binaryCandidate = "";
+  let binaryRemainder = "";
   let binaryMode = null;
+  let binaryDecoder = null;
 
   return {
     push(value) {
@@ -1053,21 +1099,74 @@ function createStreamingTextNormalizer() {
       if (!/^[01\s]+$/.test(combined)) {
         binaryMode = false;
         binaryCandidate = "";
+        binaryRemainder = "";
+        binaryDecoder = null;
         return combined;
       }
 
       binaryMode = true;
       binaryCandidate = combined;
-      return "";
+      binaryRemainder += value;
+
+      const parsed = takeCompleteBinaryBytes(binaryRemainder);
+      binaryRemainder = parsed.remainder;
+      if (!parsed.bytes.length) return "";
+
+      binaryDecoder ||= new TextDecoder("utf-8");
+      return binaryDecoder.decode(new Uint8Array(parsed.bytes), { stream: true });
     },
     flush() {
       if (!binaryCandidate) return "";
 
-      const text = binaryMode === true ? normalizeUpstreamText(binaryCandidate) : binaryCandidate;
+      let text = "";
+      if (binaryMode === true) {
+        const parsed = takeCompleteBinaryBytes(binaryRemainder, true);
+        binaryRemainder = parsed.remainder;
+        binaryDecoder ||= new TextDecoder("utf-8");
+        if (parsed.bytes.length) text += binaryDecoder.decode(new Uint8Array(parsed.bytes), { stream: true });
+        text += binaryDecoder.decode();
+        if (!text && binaryCandidate) text = normalizeUpstreamText(binaryCandidate);
+      } else {
+        text = binaryCandidate;
+      }
+
       binaryCandidate = "";
+      binaryRemainder = "";
+      binaryDecoder = null;
       return text;
     },
   };
+}
+
+function takeCompleteBinaryBytes(value, flush = false) {
+  const text = String(value || "").replace(/^\s+/, "");
+  if (!text) return { bytes: [], remainder: "" };
+
+  const endsWithSeparator = /\s$/.test(text);
+  const parts = text.split(/\s+/).filter(Boolean);
+  let remainder = "";
+
+  if (!endsWithSeparator && parts.length) {
+    remainder = parts.pop();
+  }
+
+  const bytes = [];
+  const leftovers = [];
+
+  for (const part of parts) {
+    if (/^[01]{8}$/.test(part)) {
+      bytes.push(parseInt(part, 2));
+    } else {
+      leftovers.push(part);
+    }
+  }
+
+  if (flush && /^[01]{8}$/.test(remainder)) {
+    bytes.push(parseInt(remainder, 2));
+    remainder = "";
+  }
+
+  return { bytes, remainder: [leftovers.join(" "), remainder].filter(Boolean).join(" ") };
 }
 
 function decodeBinaryUtf8IfNeeded(value) {
