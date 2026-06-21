@@ -498,7 +498,7 @@ async function collectUnlimitedText(request, env, path, payload) {
     if (event.finish && event.reason) finishReason = event.reason;
   }
 
-  return { text, finishReason, annotations, rawEvents: events };
+  return { text: normalizeUpstreamText(text), finishReason, annotations, rawEvents: events };
 }
 
 async function getModelCatalog(request, env) {
@@ -668,6 +668,7 @@ function streamUnlimitedEvents(upstream, handlers) {
   return new ReadableStream({
     async start(controller) {
       let finished = false;
+      const textNormalizer = createStreamingTextNormalizer();
       handlers.start && handlers.start(controller);
 
       try {
@@ -687,17 +688,24 @@ function streamUnlimitedEvents(upstream, handlers) {
             if (!parsed) continue;
 
             if (typeof parsed.delta === "string" && parsed.delta.length) {
-              handlers.delta && handlers.delta(controller, parsed.delta, parsed);
+              const text = textNormalizer.push(parsed.delta);
+              if (text) handlers.delta && handlers.delta(controller, text, parsed);
             }
 
             if (parsed.finish || parsed.done) {
+              const text = textNormalizer.flush();
+              if (text) handlers.delta && handlers.delta(controller, text, parsed);
               finished = true;
               handlers.finish && handlers.finish(controller, parsed.reason || "stop", parsed);
             }
           }
         }
 
-        if (!finished) handlers.finish && handlers.finish(controller, "stop", {});
+        if (!finished) {
+          const text = textNormalizer.flush();
+          if (text) handlers.delta && handlers.delta(controller, text, {});
+          handlers.finish && handlers.finish(controller, "stop", {});
+        }
       } catch (error) {
         controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ error: error.message || String(error) })}\n\n`));
       } finally {
@@ -1007,6 +1015,55 @@ function parseSseJson(data) {
     return JSON.parse(data);
   } catch (_) {
     return null;
+  }
+}
+
+function normalizeUpstreamText(text) {
+  return decodeBinaryUtf8IfNeeded(text);
+}
+
+function createStreamingTextNormalizer() {
+  let binaryCandidate = "";
+  let binaryMode = null;
+
+  return {
+    push(value) {
+      if (typeof value !== "string" || !value) return value;
+      if (binaryMode === false) return value;
+
+      const combined = binaryCandidate + value;
+      if (!/^[01\s]+$/.test(combined)) {
+        binaryMode = false;
+        binaryCandidate = "";
+        return combined;
+      }
+
+      binaryMode = true;
+      binaryCandidate = combined;
+      return "";
+    },
+    flush() {
+      if (!binaryCandidate) return "";
+
+      const text = binaryMode === true ? normalizeUpstreamText(binaryCandidate) : binaryCandidate;
+      binaryCandidate = "";
+      return text;
+    },
+  };
+}
+
+function decodeBinaryUtf8IfNeeded(value) {
+  if (typeof value !== "string") return value;
+
+  const text = value.trim();
+  if (!/^[01]{8}(?:\s+[01]{8})+$/.test(text)) return value;
+
+  try {
+    const bytes = text.split(/\s+/).map((byte) => parseInt(byte, 2));
+    const decoded = new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array(bytes));
+    return decoded || value;
+  } catch (_) {
+    return value;
   }
 }
 
