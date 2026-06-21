@@ -661,58 +661,76 @@ function streamAnthropicMessages(upstream, meta) {
   });
 }
 
-function streamUnlimitedEvents(upstream, handlers) {
-  const encoder = new TextEncoder();
+async function streamUnlimitedEvents(upstream, handlers, controller, textNormalizer) {
+  const reader = upstream.body.getReader();
   const decoder = new TextDecoder();
+  let buffer = "";
+  let finished = false;
 
-  return new ReadableStream({
-    async start(controller) {
-      let finished = false;
-      const textNormalizer = createStreamingTextNormalizer();
-      handlers.start && handlers.start(controller);
+  const flushEvent = (parsed) => {
+    if (typeof parsed.delta === "string" && parsed.delta.length) {
+      const text = textNormalizer.push(parsed.delta);
+      if (text) handlers.delta && handlers.delta(controller, text, parsed);
+    }
+    if (parsed.finish || parsed.done) {
+      const tail = textNormalizer.flush();
+      if (tail) handlers.delta && handlers.delta(controller, tail, parsed);
+      finished = true;
+      handlers.finish && handlers.finish(controller, parsed.reason || "stop", parsed);
+    }
+  };
 
-      try {
-        const reader = upstream.body.getReader();
-        let buffer = "";
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split(/\r?\n/);
-          buffer = lines.pop() || "";
-
-          for (const line of lines) {
-            if (!line.startsWith("data:")) continue;
-            const parsed = parseSseJson(line.slice(5).trim());
-            if (!parsed) continue;
-
-            if (typeof parsed.delta === "string" && parsed.delta.length) {
-              const text = textNormalizer.push(parsed.delta);
-              if (text) handlers.delta && handlers.delta(controller, text, parsed);
-            }
-
-            if (parsed.finish || parsed.done) {
-              const text = textNormalizer.flush();
-              if (text) handlers.delta && handlers.delta(controller, text, parsed);
-              finished = true;
-              handlers.finish && handlers.finish(controller, parsed.reason || "stop", parsed);
-            }
-          }
-        }
-
+  const drainBuffer = (final) => {
+    // 按完整事件块（空行分隔）解析，聚合多行 data:
+    const parts = buffer.split(/\r?\n\r?\n/);
+    buffer = final ? "" : (parts.pop() || "");
+    const blocks = final ? parts.concat(buffer ? [buffer] : []) : parts;
+    for (const raw of blocks) {
+      const dataLines = raw
+        .split(/\r?\n/)
+        .filter((l) => l.startsWith("data:"))
+        .map((l) => l.slice(5).replace(/^ /, ""));
+      if (!dataLines.length) continue;
+      const joined = dataLines.join("\n").trim();
+      if (joined === "[DONE]") {
         if (!finished) {
-          const text = textNormalizer.flush();
-          if (text) handlers.delta && handlers.delta(controller, text, {});
+          const tail = textNormalizer.flush();
+          if (tail) handlers.delta && handlers.delta(controller, tail, {});
+          finished = true;
           handlers.finish && handlers.finish(controller, "stop", {});
         }
-      } catch (error) {
-        controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ error: error.message || String(error) })}\n\n`));
-      } finally {
-        controller.close();
+        continue;
       }
-    },
-  });
+      const parsed = parseSseJson(joined);
+      if (parsed) flushEvent(parsed);
+    }
+  };
+
+  try {
+    while (true) {
+      let chunk;
+      try {
+        chunk = await readWithTimeout(reader, 60000);
+      } catch (e) {
+        // idle 超时：收尾而非丢弃
+        break;
+      }
+      if (chunk.done) break;
+      buffer += decoder.decode(chunk.value, { stream: true });
+      drainBuffer(false);
+      if (finished) break;
+    }
+  } finally {
+    buffer += decoder.decode(); // flush 解码器残留字节
+    if (!finished) drainBuffer(true);
+    if (!finished) {
+      const tail = textNormalizer.flush();
+      if (tail) handlers.delta && handlers.delta(controller, tail, {});
+      handlers.finish && handlers.finish(controller, "stop", {});
+      finished = true;
+    }
+    try { reader.releaseLock(); } catch (_) {}
+  }
 }
 
 async function readUnlimitedEvents(response) {
